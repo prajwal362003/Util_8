@@ -1,0 +1,73 @@
+package com.sbi.controller;
+
+
+import net.lingala.zip4j.ZipFile;
+import net.lingala.zip4j.exception.ZipException;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * Single class to unzip a password-protected ZIP file.
+ * Compatible with Java 25 and Spring 7 environments.
+ */
+
+public class UnzipFile {
+
+	// Configuration constants
+	private static final String ZIP_FILE_PATH = "E:\\ReKYC_Perfios\\Unzip_File\\Prod\\15156_LOT3_29092026_Details.zip"; //E:\ReKYC_Perfios\Unzip_File\Prod
+	private static final String DESTINATION_DIR = "E:\\ReKYC_Perfios\\Unzip_File\\Prod\\Output";
+	private static final String PASSWORD = "password@95";//August 28, 2025
+
+	public static void main(String[] args) {
+		System.out.println("Starting unzip process...");
+
+
+		try {
+			unzipProtectedZip(ZIP_FILE_PATH, DESTINATION_DIR, PASSWORD);
+			System.out.println("SUCCESS: Files extracted to '" + new File(DESTINATION_DIR).getAbsolutePath() + "'");
+		} catch (IOException e) {
+			System.err.println("ERROR: Failed to unzip file.");
+			e.printStackTrace();
+		}
+	}
+
+	/**
+	 * Unzips a password-protected ZIP file to the specified directory.
+	 *
+	 * @param zipFilePath Path to the source ZIP file
+	 * @param destDir     Path to the destination directory
+	 * @param password    Password for the ZIP file
+	 * @throws IOException if extraction fails
+	 */
+	public static void unzipProtectedZip(String zipFilePath, String destDir, String password) throws IOException {
+		File zipFile = new File(zipFilePath);
+
+		if (!zipFile.exists())  throw new IOException("ZIP file not found: " + zipFilePath);
+		
+		try {
+			// Initialize ZipFile with password directly via constructor or setter
+			ZipFile zip = new ZipFile(zipFile);
+			if (zip.isEncrypted()) zip.setPassword(password.toCharArray());
+			 else System.out.println("Warning: File is not encrypted, but password was provided.");
+
+			// Create destination directory if it doesn't exist
+			File destDirectory = new File(destDir);
+			if (!destDirectory.exists()) destDirectory.mkdirs();
+				
+			
+
+			// Extract all contents
+			zip.extractAll(destDir);
+
+		} catch (ZipException e) {
+			throw new IOException("Extraction failed: " + e.getMessage(), e);
+		}
+	}
+}   
+
+
