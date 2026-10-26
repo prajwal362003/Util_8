@@ -1,0 +1,143 @@
+package com.sbi.DAO;
+
+import com.sbi.model.CustomerRecord;
+import com.sbi.model.ProcessingHistory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.stereotype.Repository;
+
+import java.sql.PreparedStatement;
+import java.sql.Types;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import com.sbi.configuration.ServerConfiguration;
+
+@Repository
+public class CkycDao {
+
+	private static final Logger log = LoggerFactory.getLogger(CkycDao.class);
+
+	@Autowired private JdbcTemplate jdbcTemplate;
+
+	@Autowired private NamedParameterJdbcTemplate namedParameterJdbcTemplate;
+
+	private static String hostName = ServerConfiguration.getCachedHostname();
+
+	private static final String EXISTS_SQL =
+			"SELECT COUNT(*) FROM kycupdate.REKYC_PERFIOS_SUMMARY_TABLE WHERE File_Name = ? ";
+
+	private static final String INSERT_CUSTOMER_SQL = """
+			INSERT INTO kycupdate.REKYC_PERFIOS_SUMMARY_TABLE (LOT_NO, SUB_LOT_NO,CIF_NUMBER,ACCOUNT_NUMBER,CATEGORIZATION,FILE_NAME,LCPC_CODE,EXCEL_PULL_TIME,EXCEL_ENTRY_DATE,ERROR_REASON)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, SYSDATE,?)
+			""";
+
+	private static final String UPDATE_CUSTOMER_SQL = """
+			update kycupdate.REKYC_PERFIOS_SUMMARY_TABLE set CATEGORIZATION=?, EXCEL_ENTRY_DATE=sysdate where CIF_NUMBER=?
+			""";
+
+	private static final String INSERT_HISTORY_SQL = """
+			INSERT INTO kycupdate.kyc_perfios_history (cif_number, account_number, zip_file, modified_date, remark, server, modified_by)
+			VALUES (?, ?, ?,sysdate,?,?,'Util_8_DB_Import')
+			""";
+
+	public boolean existsBySummaryFileName(String summaryFileName) {
+		log.info("check existing records : {}",EXISTS_SQL);
+		try{
+			Long count = jdbcTemplate.queryForObject(EXISTS_SQL, Long.class, summaryFileName);
+			log.info("Count : " + count);
+			return (count != null && count > 0);
+		}catch(Exception e) {
+			log.error(e.getMessage());
+			return false;
+		}
+	}
+
+	public int[][] batchInsertCustomerData(List<CustomerRecord> records, String zipFileName,
+			String summaryFileName, int batchSize) {
+		if (records.isEmpty()) return new int[0][0];
+		log.info("summaryFileName: {}",summaryFileName);
+		return jdbcTemplate.batchUpdate(
+				INSERT_CUSTOMER_SQL,
+				records,
+				batchSize,
+				(PreparedStatement ps, CustomerRecord r) -> {
+					ps.setString(1, r.lotNo());
+					ps.setString(2, r.subLotNo());
+					ps.setString(3, r.cifNo());
+					ps.setString(4, r.accountNumber());
+					ps.setString(5, r.categorization());
+					ps.setString(6, r.fileName());
+					ps.setString(7, r.lcpc());
+					if (r.excelPullTime() != null) ps.setDate(8, java.sql.Date.valueOf(r.excelPullTime())); else ps.setNull(8, Types.DATE);
+					ps.setString(9, r.errorReason());
+				}
+				);
+	}
+
+	public int[][] batchUpdateCustomerData(List<CustomerRecord> records, String zipFileName, String summaryFileName,
+			int size) {
+		if (records.isEmpty()) return new int[0][0];
+		log.info("records: {}",records.size());
+		return jdbcTemplate.batchUpdate(
+				UPDATE_CUSTOMER_SQL,
+				records,
+				size,
+				(PreparedStatement ps, CustomerRecord r) -> {
+					ps.setString(1, r.categorization());
+					ps.setString(2, r.cifNo());
+				}
+				);
+	}
+
+
+	public int[][] insertHistory(List<CustomerRecord> records, int batchSize) {
+		if (records == null || records.isEmpty())  return new int[0][0];
+
+		log.info("Total records in insertHistory : {}" + batchSize);
+		return jdbcTemplate.batchUpdate(
+				INSERT_HISTORY_SQL,
+				records,
+				batchSize,
+				(PreparedStatement ps, CustomerRecord r) -> {
+					ps.setString(1, r.cifNo());
+					ps.setString(2, r.accountNumber());
+					ps.setString(3, r.fileName());
+					ps.setString(4, r.errorReason());
+					ps.setString(5, hostName);	
+				}
+				);
+	}
+
+	private static final String EXISTS_CUSTOMER_SETL =
+			"SELECT CIF_NUMBER FROM kycupdate.REKYC_PERFIOS_SUMMARY_TABLE WHERE File_Name = ? ";//AND status = 'SUCCESS'
+
+	public Set<String> getExistingCustomerNumbers(String summaryFileName) {
+		return jdbcTemplate.query(EXISTS_CUSTOMER_SETL, (rs, rowNum) -> rs.getString("CIF_NUMBER"),summaryFileName)
+				.stream()
+				.collect(Collectors.toCollection(HashSet::new));
+	}
+
+
+	private static final String EXISTS_CIF_SET =
+			"SELECT CIF_NUMBER FROM kycupdate.REKYC_PERFIOS_SUMMARY_TABLE WHERE CIF_NUMBER IN (:cifs ) ";//AND status = 'SUCCESS'
+
+	public Set<String> getExistingCifNumbers(Set<String> xlsxCifs) {
+		log.info("EXISTS_CIF_SET query : {}" + EXISTS_CIF_SET);
+		if(xlsxCifs==null||xlsxCifs.isEmpty()) return Collections.emptySet();
+
+		MapSqlParameterSource mp = new MapSqlParameterSource();
+		mp.addValue("cifs", xlsxCifs);
+
+		return namedParameterJdbcTemplate.query(EXISTS_CIF_SET, mp, (rs, rowNum) -> rs.getString("CIF_NUMBER"))
+				.stream()
+				.collect(Collectors.toSet());
+	}
+}
