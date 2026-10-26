@@ -1,0 +1,59 @@
+# ==========================================================================
+# CKYC Batch Processor - configuration
+# Each of the 4 servers gets its OWN copy of this file, differing ONLY in
+# server.id (and possibly db pool sizing). Everything else points at the
+# SAME shared NFS paths so all 4 instances cooperate on the same input queue.
+# ==========================================================================
+
+# Unique id per server instance - MUST be different on each of the 4 boxes
+# e.g. server.id=SVR01 / SVR02 / SVR03 / SVR04
+server.id=SVR01
+
+# ---- NFS shared directories (same across all 4 servers) ----
+dir.input=/REKYC/UTIL_9_DB_IMPORT/LCPC_INPUT
+dir.processing=/REKYC/UTIL_9_DB_IMPORT/PROCESSING
+dir.backup=/REKYC/UTIL_9_DB_IMPORT/BACKUP
+dir.processed=/REKYC/UTIL_9_DB_IMPORT/PROCESSED
+dir.error=/REKYC/UTIL_9_DB_IMPORT/EXCEPTION
+dir.output=/REKYC/UTIL_9_DB_IMPORT/OUTPUT
+dir.work=/REKYC/UTIL_9_DB_IMPORT/WORK
+
+
+# ---- Zip handling ----
+zip.password=password@
+zip.file.pattern=.*\\.zip$
+zip.details.file.suffix=_CKYC_Details.xlsx
+zip.summary.file.suffix=_Summary.xlsx
+
+# ---- Scheduling ----
+scan.fixed.delay.ms=30000
+scan.initial.delay.ms=5000
+stale.claim.minutes=60
+stale.recovery.fixed.delay.ms=300000
+
+# ---- DB batch tuning ----
+db.batch.size=500
+
+# ---- DataSource ----
+db.driverClassName=oracle.jdbc.OracleDriver
+db.url=jdbc:oracle:thin:@10.176.8.9:1522:CKYC
+db.username=CKYC
+db.password=password
+db.pool.maxTotal=10
+db.pool.maxIdle=5
+db.pool.minIdle=2
+
+
+##########
+DB_URL=jdbc:oracle:thin:@10.176.8.9:1522:CKYC
+DB_USER=CKYC
+DB_PASSWORD=password
+DBURL=jdbc:oracle:thin:@10.176.8.9:1522:CKYC
+DBUSER=kycupdate
+DBPASSWORD=password
+DRIVERCLASS=oracle.jdbc.OracleDriver
+DB.maximumPoolSize=2
+DB.minimumIdle=2
+DB.connectionTimeout=30000
+DB.idleTimeout=30000
+DB.conPoolName=dev_conn
