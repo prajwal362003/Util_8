@@ -1,0 +1,19 @@
+package com.sbi.utils;
+
+import java.util.Map;
+
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.DataFormatter;
+import org.apache.poi.ss.usermodel.Row;
+
+public class XlsUtils {
+	
+	   public static String getExcelValue(Row row, Map<String, Integer> headerIdx, String columnName, DataFormatter formatter) {
+		   Integer columnIndex=headerIdx.get(columnName);
+		   if(columnIndex==null)return "";
+		   Cell cell = row.getCell(columnIndex,Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+		   if(cell==null)return "";
+		   return formatter.formatCellValue(cell).trim();
+		}
+}
+
