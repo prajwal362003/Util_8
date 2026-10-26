@@ -1,0 +1,678 @@
+package com.sbi.controller;
+
+import com.sbi.configuration.*;
+import com.sbi.exception.LotProcessingException;
+import com.sbi.DAO.CkycDao;
+import com.sbi.model.CustomerRecord;
+import com.sbi.model.ProcessingHistory;
+import com.sbi.utils.CsvUtils;
+import com.sbi.utils.XlsUtils;
+
+import net.lingala.zip4j.ZipFile;
+import net.lingala.zip4j.model.FileHeader;
+
+import org.apache.poi.openxml4j.util.ZipSecureFile;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.DataFormatter;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.WeekFields;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Stream;
+
+import javax.swing.text.DateFormatter;
+
+@Controller
+public class CkycLotController {
+
+	private static final Logger log = LoggerFactory.getLogger(CkycLotController.class);
+	private static final DateTimeFormatter DOB_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+	private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmssSSS");
+	
+
+	@Autowired private AppProperties props;
+	@Autowired private CkycDao dao;
+	@Autowired private TransactionTemplate transactionTemplate;
+
+	// ==================================================================
+	// Scheduled entry points
+	// ==================================================================
+
+	// @Scheduled(initialDelayString = "${scan.initial.delay.ms}", fixedDelayString = "${scan.fixed.delay.ms}")
+	public void scanAndProcess() {
+		log.info("Inside CkycLotController");
+		recoverStaleClaims();
+
+		List<Path> candidates;
+		try {
+			candidates = listCandidateZips();
+		} catch (IOException e) {
+			log.error("[{}] Failed to list input directory: {}", props.getServerId(), e.getMessage());
+			return;
+		}
+
+		for (Path candidate : candidates) {
+			Optional<Path> claimed = tryClaim(candidate);
+			if (claimed.isEmpty()) {
+				continue; // another server (or thread) already took it
+			}
+			try {
+				processClaimedZip(claimed.get());
+			} catch (Exception e) {
+				// Never let one bad file stop the scan of the rest.
+				log.error("[{}] Unexpected failure processing {}: {}", props.getServerId(),
+						claimed.get().getFileName(), e.getMessage(), e);
+				moveQuietly(claimed.get(), props.errorPath());
+			}
+		}
+	}
+
+	//  @Scheduled(fixedDelayString = "${stale.recovery.fixed.delay.ms}")
+	public void recoverStaleClaimsScheduled() {
+		recoverStaleClaims();
+	}
+
+	// ==================================================================
+	// File claim (multi-server safe queue)
+	// ==================================================================
+
+	private List<Path> listCandidateZips() throws IOException {
+		Path input = props.inputPath();
+		if (!Files.isDirectory(input)) {
+			log.warn("Input directory does not exist yet: {}", input);
+			return List.of();
+		}
+		List<Path> result = new ArrayList<>();
+		try (Stream<Path> stream = Files.list(input)) {
+			stream.filter(Files::isRegularFile)
+			.filter(p -> props.zipFilePattern().matcher(p.getFileName().toString()).matches())
+			.sorted()
+			.forEach(result::add);
+		}
+		return result;
+	}
+
+	private Optional<Path> tryClaim(Path candidate) {
+		Path myProcessingDir = props.processingPathForThisServer();
+		try {
+			Files.createDirectories(myProcessingDir);
+			Path target = myProcessingDir.resolve(candidate.getFileName());
+			Files.move(candidate, target, StandardCopyOption.ATOMIC_MOVE);
+			log.info("[{}] Claimed file: {}", props.getServerId(), candidate.getFileName());
+			return Optional.of(target);
+		} catch (NoSuchFileException | FileAlreadyExistsException e) {
+			return Optional.empty();
+		} catch (IOException e) {
+			log.error("[{}] Error claiming {}: {}", props.getServerId(), candidate.getFileName(), e.getMessage());
+			return Optional.empty();
+		}
+	}
+
+	/** Only ever touches THIS server's own processing subdirectory - cannot race another live server. */
+	private void recoverStaleClaims() {
+		log.info("Inside recoverStaleClaims");
+		Path myProcessingDir = props.processingPathForThisServer();
+
+		log.info("ProcessingDir : {}", myProcessingDir);
+
+		// boolean isDir = Files.isDirectory(myProcessingDir);
+		if (!Files.isDirectory(myProcessingDir)) return;
+		log.info("props.getStaleClaimMinutes() " + props.getStaleClaimMinutes());
+		Instant staleBefore = Instant.now().minusSeconds(props.getStaleClaimMinutes() * 60);
+		log.info("staleBefore : " + staleBefore);
+
+		try (Stream<Path> stream = Files.list(myProcessingDir)) {
+
+			for (Path p : stream.filter(Files::isRegularFile).toList()) {
+				FileTime mtime = Files.getLastModifiedTime(p);
+				if (mtime.toInstant().isBefore(staleBefore)) {
+					Path back = props.inputPath().resolve(p.getFileName());
+					try {
+						Files.move(p, back, StandardCopyOption.ATOMIC_MOVE);
+						log.info("[{}] Recovered stale claim, requeued: {}", props.getServerId(), p.getFileName());
+					} catch (IOException ex) {
+						log.error("[{}] Failed to requeue stale file {}: {}", props.getServerId(), p, ex.getMessage());
+					}
+				}
+			}
+		} catch (IOException e) {
+			log.error("[{}] Error scanning for stale claims: {}", props.getServerId(), e.getMessage());
+		}
+	}
+
+	// ==================================================================
+	// Per-file pipeline
+	// ==================================================================
+	//            //lotNo = summaryFileName.split("_")[1];
+
+	private void processClaimedZip(Path claimedZip) throws IOException {
+		LocalDateTime start = LocalDateTime.now();
+		String zipFileName = claimedZip.getFileName().toString();
+		log.info("[{}] Processing {}", props.getServerId(), zipFileName);
+
+		// 1) Backup BEFORE any extraction/parsing is attempted.
+		backup(claimedZip);
+
+		// 2) Decrypt + extract the two CSVs into a per-file work directory.
+		Path workDir = props.processingPathForThisServer().resolve(stripExt(zipFileName) + "_" + TS_FMT.format(start));
+		Path detailsXls;
+		Path summaryXls;
+		try {
+			var pair = extractZip(claimedZip, workDir);
+			detailsXls = pair.details();
+			summaryXls = pair.summary();
+		} catch (LotProcessingException e) {
+			recordFailureAndMove(claimedZip, zipFileName, null, start, "EXTRACT_FAILED: " + e.getMessage());
+			cleanup(workDir);
+			return;
+		}
+		// 3) Parse.
+		String summaryFileName = summaryXls.getFileName().toString();
+		log.info("summaryFileName : "+summaryFileName);
+
+		String lotNo;
+		List<CustomerRecord> records;
+		List<String> warnings;
+		try {
+			lotNo = extractLotNoFromSummary(summaryXls);
+			log.info("lotNo : "+lotNo);
+
+			// List<String> lines = Files.readAllLines(detailsXls, StandardCharsets.UTF_8);
+
+			records = new ArrayList<>();
+			warnings = new ArrayList<>();
+			log.info("_____ : ");
+			
+			parseDetails(summaryXls, lotNo, records, warnings);
+			log.info("Total records parsed : "+records.size());
+			log.info("Total warnings: {}" + warnings.size());
+
+		} catch (Exception e) {
+			recordFailureAndMove(claimedZip, zipFileName, summaryFileName, start, "PARSE_FAILED: " + e.getMessage());
+			cleanup(workDir);
+			return;
+		}
+
+		boolean[] committed = {false};
+		String[] errorHolder = {null};
+
+		//final String finalLotNo = lotNo;
+		log.info("Total warnings: {}" + warnings.size());
+		// 4) Idempotency check - has this summary file already been loaded successfully?
+		
+		boolean existsByFileName= dao.existsBySummaryFileName(summaryFileName);
+		log.info("existsByFileName " +existsByFileName);
+		Set<String> xlsxCifs = storeIntoSet(records);
+		log.info("xlsxCifs " +xlsxCifs.size());
+
+		Set<String> existingCustomers = dao.getExistingCifNumbers(xlsxCifs);
+				//dao.getExistingCustomerNumbers(summaryFileName);
+		log.info("existingCustomers " +existingCustomers.size());
+		
+		if (existsByFileName||existingCustomers.size()>0) {
+			log.warn("[{}] Duplicate detected,{}", props.getServerId(), summaryFileName);
+			
+			List<CustomerRecord> updateList = new ArrayList<>();
+			List<CustomerRecord> insertList = new ArrayList<>();
+		
+			for(CustomerRecord customerRecord : records) {
+				if(existingCustomers.contains(customerRecord.cifNo()))
+					updateList.add(customerRecord);
+				else
+					insertList.add(customerRecord);
+			}
+			log.info("updateList " +updateList.size());
+			if(updateList.size()>0) {
+				transactionTemplate.execute(status -> {
+					try {
+						log.info("executing batches for updateList ");
+						dao.batchUpdateCustomerData(updateList, zipFileName, summaryFileName, updateList.size());
+						dao.insertHistory(updateList,updateList.size());
+						committed[0] = true;
+						return null;
+					} catch (Exception e) {
+						status.setRollbackOnly();
+						errorHolder[0] = e.getMessage();
+						return null;
+					}
+				});
+			}
+			log.info("insertList " +insertList.size());
+			if(insertList.size()>0) {
+				// 5) Batch insert + history insert in one transaction.
+				transactionTemplate.execute(status -> {
+					try {
+						log.info("executing batches for insertList ");
+						dao.batchInsertCustomerData(insertList, zipFileName, summaryFileName, insertList.size());
+						dao.insertHistory(insertList,insertList.size());
+						committed[0] = true;
+						return null;
+					} catch (Exception e) {
+						status.setRollbackOnly();
+						errorHolder[0] = e.getMessage();
+						return null;
+					}
+				});
+			}
+
+		}else {
+
+			log.info("Total records in else : {}" + records.size());
+			final List<CustomerRecord> finalRecords = records;
+			// 5) Batch insert + history insert in one transaction.
+			transactionTemplate.execute(status -> {
+				try {
+					log.info("transactionTemplate.execute");
+					int[][] a =dao.batchInsertCustomerData(finalRecords, zipFileName, summaryFileName, props.getDbBatchSize());
+					log.info("__________________!!  !! ! ______________________" );
+					log.info("Total records in else : {}" + a.length);
+
+					dao.insertHistory(finalRecords,finalRecords.size());
+
+					committed[0] = true;
+					return null;
+				} catch (Exception e) {
+					log.error("transactionTemplate.execute {}",e);
+					status.setRollbackOnly();
+					errorHolder[0] = e.getMessage();
+					return null;
+				}
+			});
+		}
+
+		log.info("__________________|______________________" );
+		LocalDateTime end = LocalDateTime.now();
+		if (committed[0]) {
+			ProcessingHistory successHistory = new ProcessingHistory(zipFileName, summaryFileName, lotNo,
+					records.size(), records.size(), 0, "SUCCESS", props.getServerId(), start, end,
+					warnings.isEmpty() ? null : String.join("; ", warnings));
+			writeResponse(stripExt(zipFileName), successHistory);
+			moveQuietly(claimedZip, props.processedPath());
+			log.info("[{}] Completed {} - {} records", props.getServerId(), zipFileName, records.size());
+		} else if ("DUPLICATE_AT_DB_LEVEL".equals(errorHolder[0])) {
+			ProcessingHistory dupHistory = new ProcessingHistory(zipFileName, summaryFileName, lotNo,
+					records.size(), 0, records.size(), "DUPLICATE", props.getServerId(), start, end,
+					"Lost DB-level race on summary_file_name unique constraint");
+			writeResponse(stripExt(zipFileName), dupHistory);
+			moveQuietly(claimedZip, props.processedPath());
+		} else {
+			recordFailureAndMove(claimedZip, zipFileName, summaryFileName, start, "DB_INSERT_FAILED: " + errorHolder[0]);
+		}
+		cleanup(workDir);
+	}
+
+	private static Set<String> storeIntoSet(List<CustomerRecord> records) {
+		Set<String> cifSet = new HashSet<>();
+		for(CustomerRecord customer: records) {
+			cifSet.add(customer.cifNo());
+		}
+		return cifSet;
+	}
+
+	private void recordFailureAndMove(Path claimedZip, String zipFileName, String summaryFileName,
+			LocalDateTime start, String reason) {
+		LocalDateTime end = LocalDateTime.now();
+		log.error("[{}] {} - {}", props.getServerId(), zipFileName, reason);
+		try {
+			ProcessingHistory failHistory = new ProcessingHistory(zipFileName,
+					summaryFileName == null ? zipFileName : summaryFileName, null, 0, 0, 0, "FAILED", props.getServerId(), start, end, reason);
+			//dao.insertHistory(insertList,insertList.size());
+			writeResponse(stripExt(zipFileName), failHistory);
+		} catch (Exception e) {
+			log.error("[{}] Also failed to record failure history for {}: {}", props.getServerId(), zipFileName, e.getMessage());
+		}
+		moveQuietly(claimedZip, props.errorPath());
+	}
+
+	// ==================================================================
+	// Backup
+	// ==================================================================
+	
+	private void backup(Path claimedZip) {
+		try {
+			log.info("claimedZip  : "+claimedZip);
+
+			copyTo(claimedZip,props.backupPath());
+			
+		} catch (IOException e) {
+			throw new LotProcessingException("Failed to back up " + claimedZip, e);
+		}
+	}
+	
+
+	
+	private void copyTo(Path source, Path target) throws IOException {
+	
+		Files.createDirectories(target);
+		Path destination=target.resolve(source.getFileName());
+		
+		log.info("Source : " + source);
+		log.info("Destination : " + destination);
+		
+		Files.copy(source, destination, StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.COPY_ATTRIBUTES);
+		
+		log.info("Successfully copied to : " + destination);
+	}
+	
+	private static void deleteDirectoryRecursively(Path target) throws IOException {
+		if(!Files.exists(target)) return;
+		try(Stream<Path> paths = Files.walk(target)){
+			paths.sorted(Comparator.reverseOrder())
+				.forEach(path->{
+					try {
+						Files.delete(path);
+					}catch(IOException e) {
+						throw new UncheckedIOException(e);
+					}
+				});
+		}catch(UncheckedIOException e) {
+			log.error("exception: {}", e.getCause());
+		}
+	}
+
+	// ==================================================================
+	// Zip extraction (password protected, zip4j)
+	// ==================================================================
+
+	private record CsvPair(Path details, Path summary) {}
+
+	private CsvPair extractZip(Path zipFile, Path destDir) {
+		try {
+			Files.createDirectories(destDir);
+			ZipFile zf = new ZipFile(zipFile.toFile());
+
+			String[] fileNameArray=zf.getFile().getName().split("_");
+			String dateString= fileNameArray[2]; 
+			
+			
+			DateTimeFormatter formatter = DateTimeFormatter.ofPattern("ddMMyyyy");
+
+			LocalDate localDate = LocalDate.parse(dateString, formatter);
+
+			ZoneId zone = ZoneId.of("Asia/Kolkata"); 
+			ZonedDateTime zdt = localDate.atStartOfDay(zone);
+
+			int month = zdt.getMonthValue();
+
+			WeekFields weekFields = WeekFields.of(Locale.getDefault()); 
+			int weekOfMonth = zdt.get(weekFields.weekOfMonth());
+			
+			String password =  props.getZipPassword()+month+weekOfMonth;//"password@""password@85";+"85";// 
+			//log.info("Zip Protected Password:" + password);
+			
+			
+			if (zf.isEncrypted()) {
+				log.info("Zip Protected Password:" + password);
+				zf.setPassword(password.toCharArray());
+			}
+
+			List<FileHeader> headers = zf.getFileHeaders();
+			if (headers.isEmpty()) {
+				throw new LotProcessingException("Zip is empty: " + zipFile);
+			}
+			log.info("Zip Protected Password:" + password);
+			try{
+				zf.extractAll(destDir.toString());
+			}catch(Exception e) {
+				log.error("Error unzipping password :" + e.getMessage());
+			}
+
+			Path details = null, summary = null;
+			List<String> found = new ArrayList<>();
+			for (FileHeader fh : headers) {
+				if (fh.isDirectory()) continue;
+				String name = fh.getFileName();
+				log.info("name:" +name);
+				found.add(name);
+				Path extracted = destDir.resolve(name);
+				log.info("extracted:" + extracted.toString());
+				if (name.endsWith(props.getDetailsFileSuffix())) details = extracted;
+				else if (name.endsWith(props.getSummaryFileSuffix())) summary = extracted;
+			}
+			log.info("details: " + details+"  summary : "+summary);
+			if (details == null || summary == null) {
+				throw new LotProcessingException("Expected one *" + props.getDetailsFileSuffix() + " and one *"
+						+ props.getSummaryFileSuffix() + " inside " + zipFile.getFileName() + " but found: " + found);
+			}
+			log.info("details: " + details+"  summary : "+summary);
+			return new CsvPair(details, summary);
+
+			//[SVR01] PAT_LOT209_28082025_1_Response_1758113224.zip - PARSE_FAILED: Input length = 1
+		} catch (net.lingala.zip4j.exception.ZipException e) {
+			throw new LotProcessingException("Failed to extract (bad password or corrupt zip): " + zipFile, e);
+		} catch (IOException e) {
+			throw new LotProcessingException("IO error extracting: " + zipFile, e);
+		}
+	}
+
+
+	private String extractLotNoFromSummary(Path summaryXlsx) throws IOException {
+		//  List<String> lines = Files.readAllLines(summaryCsv, StandardCharsets.UTF_8);
+
+		log.info("Excel Path : {}", summaryXlsx);
+		log.info("File name : {}", summaryXlsx.getFileName());
+		log.info("Exists : {}", Files.exists(summaryXlsx));
+		log.info("Is regular file : {}", Files.isRegularFile(summaryXlsx));
+		log.info("File Size : {}", Files.size(summaryXlsx));
+
+		DataFormatter formatter = new DataFormatter();
+
+		//try(Workbook workbook = WorkbookFactory.create(summaryXlsx.toFile())){
+		
+		
+		ZipSecureFile.setMinInflateRatio(0.001);  // or 0.001, or 0 to disable the check entirely
+
+
+		try(InputStream is = Files.newInputStream(summaryXlsx);
+				XSSFWorkbook workbook=new XSSFWorkbook(is)){
+			log.info("workbook : ");
+			Sheet sheet = workbook.getSheetAt(0);
+			log.info("2 : ");
+			if (sheet.getPhysicalNumberOfRows() < 2)  return null;
+			Row headerRow = sheet.getRow(0);
+			if (headerRow == null)  return null;
+			log.info("headerRow : "/* +headerRow */);
+			Map<String,Integer> headerMap = new HashMap<>();
+			for (Cell cell : headerRow) {
+				log.info("3 : "+ formatter.formatCellValue(cell).trim());
+				headerMap.put(formatter.formatCellValue(cell).trim(), cell.getColumnIndex());
+			}
+			Integer lotNoColumn = headerMap.get("Lot No");
+			log.info("4 : ");
+			if (lotNoColumn == null) return null;
+			Row firstRow = sheet.getRow(1);
+			log.info("firstRow : "/* +firstRow */);
+			if (firstRow == null)return null;
+			Cell lotCell = firstRow.getCell(lotNoColumn);
+			log.info("lotCell : "+lotCell);
+			return formatter.formatCellValue(lotCell).trim();
+		}
+	}
+
+
+
+	private void parseDetails(Path detailsXls, String lotNo, List<CustomerRecord> records, List<String> warnings) throws IOException {
+
+		DataFormatter formatter = new DataFormatter();
+		try (InputStream is = Files.newInputStream(detailsXls);
+				XSSFWorkbook workbook = new XSSFWorkbook(is)){
+
+			Sheet sheet = workbook.getSheetAt(0);
+			
+			String lcpc=detailsXls.getFileName().toString().split("_")[0];
+
+			log.info("Details sheet name : {}",sheet.getSheetName());
+			log.info("Last Row Number : {}",sheet.getLastRowNum());
+
+			Row headerRow = sheet.getRow(0);
+			if (headerRow == null) {
+				throw new IOException("Header Row not found in details XLSX");
+			}
+
+			Map<String,Integer>headerIdx = new HashMap<>();
+
+			for (Cell cell : headerRow) {
+				String headerName = formatter.formatCellValue(cell).trim();
+
+				if (!headerName.isEmpty()) {
+					headerIdx.put(headerName, cell.getColumnIndex());
+
+					log.info("Header [{}] -> column [{}]," + headerName, cell.getColumnIndex());
+				}
+			}
+
+			for (int rowNo = 1;rowNo <= sheet.getLastRowNum();rowNo++) {
+				Row row = sheet.getRow(rowNo);
+				if (row == null || isRowEmpty(row,formatter)) continue;
+
+				try {
+					records.add(toCustomerRecord(row,headerIdx,lotNo,formatter,lcpc,detailsXls.getFileName().toString()));	//CustomerRecord record = toCustomerRecord(row,headerIdx,lotNo,formatter);
+				}catch(Exception e) {
+					String warning = "Row" + (rowNo+1) + " skipped: " + e.getLocalizedMessage();
+					warnings.add(warning);
+					log.error(warning,e);
+				}
+			}
+		}
+	}
+
+	private boolean isRowEmpty(Row row,DataFormatter formatter) {
+		if (row == null) return true;
+		for (Cell cell: row) {
+			String value = formatter.formatCellValue(cell).trim();
+			if (!value.isEmpty()) return false;
+		}
+		return true;
+	}
+
+	private CustomerRecord toCustomerRecord(Row row, Map<String, Integer> h, String lotNo,DataFormatter formatter, String lcpc, String fileName) {
+
+		String subLotNo = XlsUtils.getExcelValue(row, h, "Sub Lot No",formatter);
+		String seqStr = XlsUtils.getExcelValue(row, h, "#",formatter);
+		Integer seqNo = null;
+		if(seqStr!=null&&!seqStr.isBlank()) {
+			String numSeq=seqStr.replaceAll("[^0-9]", "");
+			if(!numSeq.isBlank()) seqNo=Integer.valueOf(numSeq);
+		}
+		      
+		return new CustomerRecord(
+				XlsUtils.getExcelValue(row, h, "Lot No",formatter),
+				XlsUtils.getExcelValue(row, h, "Sub Lot No",formatter),
+				XlsUtils.getExcelValue(row, h, "CIF",formatter),
+				XlsUtils.getExcelValue(row, h, "Account number",formatter),
+				XlsUtils.getExcelValue(row, h, "Categorization",formatter),
+				fileName,
+				lcpc,
+				parseDob(XlsUtils.getExcelValue(row, h, "ExcelPullTime",formatter)),
+				parseDob(XlsUtils.getExcelValue(row, h, "ExcelEntryTime",formatter)),
+				XlsUtils.getExcelValue(row, h, "Error Reason",formatter)
+				);
+	}
+
+
+	private LocalDate parseDob(String raw) {
+		if (raw == null) return null;
+		try {
+			return LocalDate.parse(raw.trim(), DOB_FMT);
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	// ==================================================================
+	// Response file
+	// ==================================================================
+
+	private void writeResponse(String zipBaseName, ProcessingHistory history) {
+		try {
+			Files.createDirectories(props.outputPath());
+			String fileName = zipBaseName + "_RESPONSE_" + TS_FMT.format(history.endTime()) + ".txt";
+			Path target = props.outputPath().resolve(fileName);
+
+			String content = """
+					CKYC LOT PROCESSING RESPONSE
+					=============================
+					Zip File          : %s
+					Summary File      : %s
+					Lot No            : %s
+					Processed By      : %s
+					Start Time        : %s
+					End Time          : %s
+					Status            : %s
+					Total Records     : %d
+					Success Records   : %d
+					Failed Records    : %d
+					Error Reason      : %s
+					""".formatted(
+							history.zipFileName(), history.summaryFileName(), history.lotNo(),
+							history.processedByServer(), history.startTime(), history.endTime(), history.status(),
+							history.totalRecords(), history.successRecords(), history.failedRecords(),
+							history.errorReason() == null ? "-" : history.errorReason()
+							);
+
+			Files.writeString(target, content, StandardCharsets.UTF_8,
+					StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+		} catch (IOException e) {
+			log.error("[{}] Failed to write response file for {}: {}", props.getServerId(), zipBaseName, e.getMessage());
+		}
+	}
+
+	// ==================================================================
+	// Helpers
+	// ==================================================================
+
+	private void moveQuietly(Path source, Path targetDir) {
+		try {
+			Files.createDirectories(targetDir);
+			Files.move(source, targetDir.resolve(source.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+		} catch (IOException e) {
+			log.error("[{}] Failed to move {} to {}: {}", props.getServerId(), source, targetDir, e.getMessage());
+		}
+	}
+
+	private void cleanup(Path workDir) {
+		try {
+			if (Files.exists(workDir)) {
+				try (Stream<Path> walk = Files.walk(workDir)) {
+					walk.sorted((a, b) -> b.compareTo(a)).forEach(p -> {
+						try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+					});
+				}
+			}
+		} catch (IOException e) {
+			log.warn("[{}] Failed to clean up work dir {}: {}", props.getServerId(), workDir, e.getMessage());
+		}
+	}
+
+	private String stripExt(String fileName) {
+		int idx = fileName.lastIndexOf('.');
+		return idx > 0 ? fileName.substring(0, idx) : fileName;
+	}
+}
