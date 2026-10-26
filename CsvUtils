@@ -1,0 +1,72 @@
+package com.sbi.utils;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Minimal RFC-4180-ish CSV line splitter (handles quoted fields containing commas)
+ * plus a header->index lookup so column ORDER in the source file never matters.
+ * Deliberately dependency-free; swap for Apache commons-csv if you prefer.
+ */
+public final class CsvUtils {
+
+    private CsvUtils() {}
+
+    public static List<String> splitLine(String line) {
+        List<String> fields = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        boolean inQuotes = false;
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (inQuotes) {
+                if (c == '"') {
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                        cur.append('"');
+                        i++;
+                    } else {
+                        inQuotes = false;
+                    }
+                } else {
+                    cur.append(c);
+                }
+            } else {
+                if (c == '"') {
+                    inQuotes = true;
+                } else if (c == ',') {
+                    fields.add(cur.toString());
+                    cur.setLength(0);
+                } else {
+                    cur.append(c);
+                }
+            }
+        }
+        fields.add(cur.toString());
+        return fields;
+    }
+
+    /** Maps trimmed, lower-cased header name -> column index. */
+    public static Map<String, Integer> headerIndex(String headerLine) {
+        List<String> cols = splitLine(headerLine);
+        Map<String, Integer> map = new HashMap<>();
+        for (int i = 0; i < cols.size(); i++) {
+            map.put(normalize(cols.get(i)), i);
+        }
+        return map;
+    }
+
+    public static String normalize(String s) {
+        return s == null ? "" : s.trim().toLowerCase().replaceAll("\\s+", " ");
+    }
+
+    /** Safe lookup: returns null (rather than throwing) if column absent or row too short. */
+    public static String get(List<String> row, Map<String, Integer> headerIdx, String columnName) {
+        Integer idx = headerIdx.get(normalize(columnName));
+        if (idx == null || idx >= row.size()) return null;
+        String v = row.get(idx);
+        if (v == null) return null;
+        v = v.trim();
+        return v.isEmpty() ? null : v;
+    }
+}
