@@ -1,0 +1,14 @@
+for (FileHeader fh : headers) {
+    if (fh.isDirectory()) continue;
+    String name = fh.getFileName();
+    log.info("name:" +name);
+    found.add(name);
+    Path extracted = destDir.resolve(name);
+    log.info("extracted:" + extracted.toString());
+
+    // NEW: strip optional _<digits> before .xlsx (Perfios now sends _1)
+    String normalized = name.replaceFirst("(?i)_\\d+(\\.xlsx)$", "$1");
+
+    if (normalized.endsWith(props.getDetailsFileSuffix())) details = extracted;
+    else if (normalized.endsWith(props.getSummaryFileSuffix())) summary = extracted;
+}
